@@ -280,216 +280,148 @@ DTO также удобно применять для аудита и логир
 
 В FastAPI «контроллером» выступает endpoint-функция, которая принимает входную модель (DTO), получает зависимости через DI и возвращает объект, соответствующий выходной модели; формат ответа можно закрепить через response_model (это поддерживает идею DTO на границе).
 
-1.  – DTO(Pydantic) – контракт границы
+#### 1. DTO(Pydantic) – контракт границы
 
-**<u>\</\> Python:</u>**
-
-\# dto.py
+```python
+# dto.py
 
 from pydantic import BaseModel, Field
-
 from datetime import date
-
 from typing import List, Optional
-
 from uuid import UUID
 
 class RecalcStatsRequestDTO(BaseModel):
-
-date_from: date
-
-date_to: date
-
-dry_run: bool = False
-
-reason: Optional\[str\] = Field(default=None, max_length=200)
+    date_from: date
+    date_to: date
+    dry_run: bool = False
+    reason: Optional[str] = Field(default=None, max_length=200)
 
 class RecalcStatsResultDTO(BaseModel):
+    run_id: UUID
+    processed: int
+    updated: int
+    warnings: List[str] = []
+```
 
-run_id: UUID
+#### 2. Repository – интерфейс + реализация на SQLAlchemy
 
-processed: int
-
-updated: int
-
-warnings: List\[str\] = \[\]
-
-2.  – Repository – интерфейс + реализация на SQLAlchemy
-
-**<u>\</\> Python:</u>**
-
-\# repositories.py
+```python
+# repositories.py
 
 from typing import Protocol, Iterable
-
 from datetime import date
 
 class OrdersRepository(Protocol):
-
-def iter_orders_in_range(self, date_from: date, date_to: date) -\> Iterable\[dict\]:
-
-...
+    def iter_orders_in_range(self, date_from: date, date_to: date) -> Iterable[dict]:
+        ...
 
 class StatsRepository(Protocol):
+    def upsert_daily_stat(self, day: date, value: int) -> None:
+        ...
 
-def upsert_daily_stat(self, day: date, value: int) -\> None:
-
-...
-
-\# sqlalchemy_repositories.py
+# sqlalchemy_repositories.py
 
 from sqlalchemy.orm import Session
-
 from sqlalchemy import select
 
 class SqlAlchemyOrdersRepository:
+    def __init__(self, session: Session):
+        self.session = session
 
-def \_\_init\_\_(self, session: Session):
-
-self.session = session
-
-def iter_orders_in_range(self, date_from, date_to):
-
-\# Здесь SQLAlchemy-запросы; наружу не отдаём Query/Session
-
-stmt = select(Order).where(Order.created_at \>= date_from,
-
-Order.created_at \< date_to)
-
-for row in self.session.execute(stmt).scalars():
-
-yield {"id": row.id, "created_at": row.created_at, "amount": row.amount}
+    def iter_orders_in_range(self, date_from, date_to):
+        # Здесь SQLAlchemy-запросы; наружу не отдаём Query/Session
+        stmt = select(Order).where(Order.created_at >= date_from,
+                                   Order.created_at < date_to)
+        for row in self.session.execute(stmt).scalars():
+            yield {"id": row.id, "created_at": row.created_at, "amount": row.amount}
 
 class SqlAlchemyStatsRepository:
+    def __init__(self, session: Session):
+        self.session = session
 
-def \_\_init\_\_(self, session: Session):
+    def upsert_daily_stat(self, day, value):
+        # Например: найти запись за день, обновить или вставить
+        ...
+```
 
-self.session = session
+#### 3. Service Layer – use-case/оркестрация
 
-def upsert_daily_stat(self, day, value):
-
-\# Например: найти запись за день, обновить или вставить
-
-...
-
-3.  – Service Layer – use-case/оркестрация
-
-**<u>\</\> Python:</u>**
-
-\# services.py
+```python
+# services.py
 
 from uuid import uuid4
-
 from collections import defaultdict
 
 class StatsAdminService:
+    def __init__(self, orders_repo, stats_repo, audit_writer):
+        self.orders_repo = orders_repo
+        self.stats_repo = stats_repo
+        self.audit_writer = audit_writer
 
-def \_\_init\_\_(self, orders_repo, stats_repo, audit_writer):
+    def recalculate(self, dto: RecalcStatsRequestDTO, *, actor_id: str) -> RecalcStatsResultDTO:
+        # 1) Политики доступа (проверка actor_id/роли) --- уровень сценария
+        # 2) Валидация диапазона (например, date_from <= date_to, лимит периода)
+        
+        # 3) Чтение данных через репозиторий
+        counters = defaultdict(int)
+        processed = 0
+        
+        for order in self.orders_repo.iter_orders_in_range(dto.date_from, dto.date_to):
+            processed += 1
+            day = order["created_at"].date()
+            counters[day] += 1
+        
+        # 4) Запись результата (или dry_run)
+        updated = 0
+        if not dto.dry_run:
+            for day, value in counters.items():
+                self.stats_repo.upsert_daily_stat(day, value)
+                updated += 1
+        
+        # 5) Аудит операции (кто запустил, параметры, итог)
+        run_id = uuid4()
+        self.audit_writer.write(
+            run_id=run_id,
+            actor_id=actor_id,
+            date_from=dto.date_from,
+            date_to=dto.date_to,
+            dry_run=dto.dry_run,
+            reason=dto.reason,
+            processed=processed,
+            updated=updated,
+        )
+        
+        return RecalcStatsResultDTO(run_id=run_id, processed=processed, updated=updated, warnings=[])
+```
 
-self.orders_repo = orders_repo
+#### 4. FastAPI endpoint – доставка и связывание зависимостей
 
-self.stats_repo = stats_repo
-
-self.audit_writer = audit_writer
-
-def recalculate(self, dto: RecalcStatsRequestDTO, \*, actor_id: str) -\> RecalcStatsResultDTO:
-
-\# 1) Политики доступа (проверка actor_id/роли) — уровень сценария
-
-\# 2) Валидация диапазона (например, date_from \<= date_to, лимит периода)
-
-\# 3) Чтение данных через репозиторий
-
-counters = defaultdict(int)
-
-processed = 0
-
-for order in self.orders_repo.iter_orders_in_range(dto.date_from, dto.date_to):
-
-processed += 1
-
-day = order\["created_at"\].date()
-
-counters\[day\] += 1
-
-\# 4) Запись результата (или dry_run)
-
-updated = 0
-
-if not dto.dry_run:
-
-for day, value in counters.items():
-
-self.stats_repo.upsert_daily_stat(day, value)
-
-updated += 1
-
-\# 5) Аудит операции (кто запустил, параметры, итог)
-
-run_id = uuid4()
-
-self.audit_writer.write(
-
-run_id=run_id,
-
-actor_id=actor_id,
-
-date_from=dto.date_from,
-
-date_to=dto.date_to,
-
-dry_run=dto.dry_run,
-
-reason=dto.reason,
-
-processed=processed,
-
-updated=updated,
-
-)
-
-return RecalcStatsResultDTO(run_id=run_id, processed=processed, updated=updated, warnings=\[\])
-
-4.  – FastAPI endpoint – доставка и связывание зависимостей
-
-**<u>\</\> Python:</u>**
-
-\# api_admin.py
+```python
+# api_admin.py
 
 from fastapi import APIRouter, Depends
-
 from sqlalchemy.orm import Session
 
 router = APIRouter(prefix="/admin")
 
-def get_db_session() -\> Session:
+def get_db_session() -> Session:
+    ...
 
-...
+def get_service(session: Session = Depends(get_db_session)) -> StatsAdminService:
+    orders_repo = SqlAlchemyOrdersRepository(session)
+    stats_repo = SqlAlchemyStatsRepository(session)
+    audit_writer = ...
+    return StatsAdminService(orders_repo, stats_repo, audit_writer)
 
-def get_service(session: Session = Depends(get_db_session)) -\> StatsAdminService:
-
-orders_repo = SqlAlchemyOrdersRepository(session)
-
-stats_repo = SqlAlchemyStatsRepository(session)
-
-audit_writer = ...
-
-return StatsAdminService(orders_repo, stats_repo, audit_writer)
-
-def get_current_admin_id() -\> str:
-
-...
+def get_current_admin_id() -> str:
+    ...
 
 @router.post("/stats/recalc", response_model=RecalcStatsResultDTO)
-
 def recalc_stats(dto: RecalcStatsRequestDTO,
-
-service: StatsAdminService = Depends(get_service),
-
-admin_id: str = Depends(get_current_admin_id)):
-
-return service.recalculate(dto, actor_id=admin_id)
-
+                 service: StatsAdminService = Depends(get_service),
+                 admin_id: str = Depends(get_current_admin_id)):
+    return service.recalculate(dto, actor_id=admin_id)
+```
 Логика разделения здесь следующая: endpoint ничего «не считает» и не знает о SQLAlchemy, сервис ничего не знает про HTTP и формат ответа, а репозитории ничего не знают про бизнес-сценарий (они только читают/пишут данные).
 
 ### 6.3 Границы ответственности и критерии выбора
@@ -535,3 +467,4 @@ DTO почти всегда обязательны на границах при�
 10. APIRouter class (FastAPI) \[Электронный ресурс\]. – URL: https://fastapi.tiangolo.com/reference/apirouter/ (дата обращения: 18.01.2026).
 
 Реферат размещен по ссылке: <https://github.com/AIS-439/Stepanov_Valerij_Nikolaevich_27>
+
