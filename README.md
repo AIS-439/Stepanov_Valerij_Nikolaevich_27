@@ -1,1 +1,0 @@
-# Stepanov_Valerij_Nikolaevich
